@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: brf-bybit-backtest
+    name: brf-bybit-backtest-v2
     runtime: node
     buildCommand: npm install
     startCommand: node server.js
@@ -10,8 +10,16 @@ services:
       - key: DAYS
         value: "730"
       - key: TOP
-        value: "35"
+        value: "50"
       - key: CONCURRENCY
         value: "4"
       - key: REQUEST_DELAY_MS
         value: "80"
+      - key: MIN_TURNOVER_24H
+        value: "10000000"
+      - key: MIN_HOLD_HOURS
+        value: "6"
+      - key: MAX_HOLD_HOURS
+        value: "72"
+      - key: MAX_CONCURRENT
+        value: "5"
