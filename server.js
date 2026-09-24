@@ -1,18 +1,5 @@
-from pathlib import Path
 
-code = r"""'use strict';
-
-/*
-  BRF v3: Basis Reversion + Funding Confirmation
-  Backtest only. Uses public Bybit V5 market-data endpoints.
-
-  This version keeps the existing BRF architecture while:
-  - Using actual funding settlement events for PnL.
-  - Keeping the hourly funding series only for signal confirmation.
-  - Avoiding look-ahead in rolling statistics and funding signals.
-  - Applying entry/exit costs consistently.
-  - Reporting detailed diagnostics.
-*/
+'use strict';
 
 const http = require('http');
 const { URL } = require('url');
@@ -24,16 +11,15 @@ const CFG = {
   interval: '60',
   defaultDays: Number(process.env.DAYS || 730),
   top: Number(process.env.TOP || 50),
-
   slotNotional: Number(process.env.SLOT_NOTIONAL || 1),
   maxConcurrent: Number(process.env.MAX_CONCURRENT || 5),
-  minHoldHours: Number(process.env.MIN_HOLD_HOURS || 6),
 
+  minHoldHours: Number(process.env.MIN_HOLD_HOURS || 6),
   basisLookbackHours: Number(process.env.BASIS_LOOKBACK_HOURS || 336),
   entryZ: Number(process.env.ENTRY_Z || 2.0),
-  minBasis: Number(process.env.MIN_BASIS || 0.0080),
+  minBasis: Number(process.env.MIN_BASIS || 0.008),
   exitZ: Number(process.env.EXIT_Z || 0.50),
-  stopZ: Number(process.env.STOP_Z || 4.00),
+  stopZ: Number(process.env.STOP_Z || 4.0),
   maxHoldHours: Number(process.env.MAX_HOLD_HOURS || 72),
 
   fundingShortHours: Number(process.env.FUNDING_SHORT_HOURS || 72),
@@ -42,25 +28,22 @@ const CFG = {
   minFunding7dAnn: Number(process.env.MIN_FUNDING_7D_ANN || 0.03),
   fundingStability: Number(process.env.FUNDING_STABILITY || 0.70),
 
-  btcStress24h: Number(process.env.BTC_STRESS_24H || -0.04),
-
-  spotFee: Number(process.env.SPOT_FEE || 0.0010),
+  spotFee: Number(process.env.SPOT_FEE || 0.001),
   perpFee: Number(process.env.PERP_FEE || 0.00055),
   slippage: Number(process.env.SLIPPAGE || 0.00040),
+
+  minNetEdgeMultiple: Number(process.env.MIN_NET_EDGE_MULTIPLE || 1.0),
+  minTurnover24h: Number(process.env.MIN_TURNOVER_24H || 10000000),
+  marketStressBreadth: Number(process.env.MARKET_STRESS_BREADTH || 0.50),
+  marketStressBasisRise6h: Number(process.env.MARKET_STRESS_BASIS_RISE_6H || 0.0025),
+  adverseBasisFloor: Number(process.env.ADVERSE_BASIS_FLOOR || 0.005),
+  adverseZExtra: Number(process.env.ADVERSE_Z_EXTRA || 2.0),
 
   klineLimit: 1000,
   fundingLimit: 200,
   requestDelayMs: Number(process.env.REQUEST_DELAY_MS || 80),
   concurrency: Number(process.env.CONCURRENCY || 4),
-  requestTimeoutMs: Number(process.env.REQUEST_TIMEOUT_MS || 20000),
-
-  minNetEdgeMultiple: Number(process.env.MIN_NET_EDGE_MULTIPLE || 1.00),
-
-  minTurnover24h: Number(process.env.MIN_TURNOVER_24H || 10_000_000),
-  marketStressBreadth: Number(process.env.MARKET_STRESS_BREADTH || 0.50),
-  marketStressBasisRise6h: Number(process.env.MARKET_STRESS_BASIS_RISE_6H || 0.0025),
-  adverseBasisFloor: Number(process.env.ADVERSE_BASIS_FLOOR || 0.0050),
-  adverseZExtra: Number(process.env.ADVERSE_Z_EXTRA || 2.0)
+  requestTimeoutMs: Number(process.env.REQUEST_TIMEOUT_MS || 20000)
 };
 
 const state = {
@@ -76,107 +59,81 @@ const state = {
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-function nowMs() {
-  return Date.now();
-}
-
-function annualizeFunding(sumHourlyRates) {
-  return sumHourlyRates * 24 * 365;
-}
-
-function safeNum(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : NaN;
-}
-
 async function api(path, params = {}, attempt = 0) {
-  const qs = new URLSearchParams();
-
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== '') {
-      qs.set(k, String(v));
+  const url = new URL(API + path);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== '') {
+      url.searchParams.set(key, String(value));
     }
   }
 
-  const url = `${API}${path}?${qs.toString()}`;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), CFG.requestTimeoutMs);
+  const timeout = setTimeout(() => controller.abort(), CFG.requestTimeoutMs);
 
   try {
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: { 'User-Agent': 'BRF-Backtest/3.0' },
-      signal: controller.signal
-    });
+    const response = await fetch(url, { signal: controller.signal });
+    const text = await response.text();
 
-    const text = await res.text();
-
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}: ${text.slice(0, 300)}`);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${text.slice(0, 300)}`);
     }
 
-    const data = JSON.parse(text);
+    const json = JSON.parse(text);
 
-    if (data.retCode !== 0) {
-      throw new Error(`Bybit ${data.retCode}: ${data.retMsg}`);
+    if (json.retCode !== 0) {
+      throw new Error(`Bybit ${json.retCode}: ${json.retMsg || 'request failed'}`);
     }
 
-    await sleep(CFG.requestDelayMs);
-    return data;
-  } catch (err) {
-    if (attempt < 4) {
-      await sleep(500 * Math.pow(2, attempt));
+    return json;
+  } catch (error) {
+    if (attempt < 3) {
+      await sleep(500 * (attempt + 1));
       return api(path, params, attempt + 1);
     }
-
-    throw err;
+    throw error;
   } finally {
-    clearTimeout(timer);
+    clearTimeout(timeout);
   }
 }
 
 async function getInstruments(category) {
+  const rows = [];
   let cursor = '';
-  const all = [];
 
   do {
-    const data = await api('/v5/market/instruments-info', {
+    const result = await api('/v5/market/instruments-info', {
       category,
       limit: 1000,
-      cursor: cursor || undefined
+      cursor
     });
 
-    const list = data.result?.list || [];
-    all.push(...list);
-    cursor = data.result?.nextPageCursor || '';
+    rows.push(...(result.result?.list || []));
+    cursor = result.result?.nextPageCursor || '';
   } while (cursor);
 
-  return all;
+  return rows;
 }
 
 async function getTickers(category) {
-  const data = await api('/v5/market/tickers', { category });
-  return data.result?.list || [];
+  const result = await api('/v5/market/tickers', { category });
+  return result.result?.list || [];
 }
 
 async function getUniverse(top) {
-  state.stage = 'universe';
-  state.message = 'Loading Bybit instruments and 24h turnover...';
-
-  const [linear, spot, linearTickers] = await Promise.all([
+  const [linear, spot, tickers] = await Promise.all([
     getInstruments('linear'),
     getInstruments('spot'),
     getTickers('linear')
   ]);
 
-  const spotSymbols = new Set(
+  const spotSet = new Set(
     spot
       .filter(x => x.status === 'Trading' && x.quoteCoin === 'USDT')
       .map(x => x.symbol)
   );
 
   const turnover = new Map(
-    linearTickers.map(x => [x.symbol, safeNum(x.turnover24h)])
+    tickers.map(x => [x.symbol, Number(x.turnover24h || 0)])
   );
 
   return linear
@@ -184,24 +141,26 @@ async function getUniverse(top) {
       x.status === 'Trading' &&
       x.contractType === 'LinearPerpetual' &&
       x.quoteCoin === 'USDT' &&
-      spotSymbols.has(x.baseCoin + 'USDT')
+      spotSet.has(`${x.baseCoin}USDT`) &&
+      (turnover.get(x.symbol) || 0) >= CFG.minTurnover24h
     )
+    .sort((a, b) =>
+      (turnover.get(b.symbol) || 0) - (turnover.get(a.symbol) || 0)
+    )
+    .slice(0, top)
     .map(x => ({
       symbol: x.symbol,
-      spot: x.baseCoin + 'USDT',
+      spotSymbol: `${x.baseCoin}USDT`,
       turnover24h: turnover.get(x.symbol) || 0
-    }))
-    .filter(x => x.turnover24h >= CFG.minTurnover24h)
-    .sort((a, b) => b.turnover24h - a.turnover24h)
-    .slice(0, top);
+    }));
 }
 
 async function getKlines(category, symbol, start, end) {
-  const pages = [];
+  const rows = [];
   let cursorEnd = end;
 
   while (cursorEnd > start) {
-    const data = await api('/v5/market/kline', {
+    const result = await api('/v5/market/kline', {
       category,
       symbol,
       interval: CFG.interval,
@@ -210,1551 +169,955 @@ async function getKlines(category, symbol, start, end) {
       limit: CFG.klineLimit
     });
 
-    const list = data.result?.list || [];
+    const list = result.result?.list || [];
     if (!list.length) break;
 
-    pages.push(...list);
+    for (const row of list) {
+      const t = Number(row[0]);
+      if (t >= start && t <= end) {
+        rows.push({
+          t,
+          open: Number(row[1]),
+          high: Number(row[2]),
+          low: Number(row[3]),
+          close: Number(row[4])
+        });
+      }
+    }
 
-    const oldest = Math.min(...list.map(x => Number(x[0])));
-
+    const oldest = Math.min(...list.map(row => Number(row[0])));
     if (!Number.isFinite(oldest) || oldest <= start) break;
 
     cursorEnd = oldest - 1;
-
-    if (pages.length > 50000) break;
+    await sleep(CFG.requestDelayMs);
   }
 
-  const dedup = new Map();
-
-  for (const r of pages) {
-    const t = Number(r[0]);
-
-    if (t >= start && t <= end) {
-      dedup.set(t, {
-        t,
-        o: Number(r[1]),
-        h: Number(r[2]),
-        l: Number(r[3]),
-        c: Number(r[4]),
-        v: Number(r[5]),
-        turnover: Number(r[6])
-      });
-    }
-  }
-
-  return [...dedup.values()].sort((a, b) => a.t - b.t);
+  return rows.sort((a, b) => a.t - b.t);
 }
 
 async function getFunding(symbol, start, end) {
-  const pages = [];
+  const rows = [];
   let cursorEnd = end;
 
   while (cursorEnd > start) {
-    const data = await api('/v5/market/funding/history', {
+    const result = await api('/v5/market/funding/history', {
       category: 'linear',
       symbol,
+      startTime: start,
       endTime: cursorEnd,
       limit: CFG.fundingLimit
     });
 
-    const list = data.result?.list || [];
+    const list = result.result?.list || [];
     if (!list.length) break;
 
-    pages.push(...list);
+    for (const row of list) {
+      const t = Number(row.fundingRateTimestamp);
+      if (t >= start && t <= end) {
+        rows.push({
+          t,
+          rate: Number(row.fundingRate)
+        });
+      }
+    }
 
     const oldest = Math.min(
-      ...list.map(x => Number(x.fundingRateTimestamp))
+      ...list.map(row => Number(row.fundingRateTimestamp))
     );
 
     if (!Number.isFinite(oldest) || oldest <= start) break;
 
     cursorEnd = oldest - 1;
-
-    if (pages.length > 10000) break;
+    await sleep(CFG.requestDelayMs);
   }
 
-  const dedup = new Map();
-
-  for (const r of pages) {
-    const t = Number(r.fundingRateTimestamp);
-
-    if (t >= start && t <= end) {
-      dedup.set(t, {
-        t,
-        rate: Number(r.fundingRate)
-      });
-    }
-  }
-
-  return [...dedup.values()].sort((a, b) => a.t - b.t);
+  return rows.sort((a, b) => a.t - b.t);
 }
 
 function rollingMeanStd(values, endIndex, lookback) {
-  const start = Math.max(0, endIndex - lookback);
-  const arr = [];
+  const start = Math.max(0, endIndex - lookback + 1);
+  const valuesInWindow = values
+    .slice(start, endIndex + 1)
+    .filter(Number.isFinite);
 
-  for (let i = start; i < endIndex; i++) {
-    const v = values[i];
-    if (Number.isFinite(v)) arr.push(v);
-  }
+  if (valuesInWindow.length < lookback) return null;
 
-  if (arr.length < Math.max(48, Math.floor(lookback * 0.5))) {
-    return { mean: NaN, std: NaN, n: arr.length };
-  }
+  const mean =
+    valuesInWindow.reduce((sum, value) => sum + value, 0) /
+    valuesInWindow.length;
 
-  let sum = 0;
-
-  for (const v of arr) {
-    sum += v;
-  }
-
-  const mean = sum / arr.length;
-
-  let ss = 0;
-
-  for (const v of arr) {
-    ss += (v - mean) ** 2;
-  }
-
-  const std = Math.sqrt(ss / Math.max(1, arr.length - 1));
+  const variance =
+    valuesInWindow.reduce(
+      (sum, value) => sum + (value - mean) ** 2,
+      0
+    ) / valuesInWindow.length;
 
   return {
     mean,
-    std,
-    n: arr.length
+    std: Math.sqrt(variance)
   };
 }
 
-function rollingSum(values, endIndex, lookback) {
-  const start = Math.max(0, endIndex - lookback);
+function basisSeries(perp, spot) {
+  const spotMap = new Map(spot.map(candle => [candle.t, candle.close]));
 
-  let sum = 0;
-  let n = 0;
-
-  for (let i = start; i < endIndex; i++) {
-    const v = values[i];
-
-    if (Number.isFinite(v)) {
-      sum += v;
-      n++;
-    }
-  }
-
-  return { sum, n };
-}
-
-/*
-  Signal model:
-  Funding settlements are mapped to the first hourly candle after settlement.
-  The hourly series is used only to estimate recent funding conditions.
-
-  PnL model:
-  Funding PnL is calculated separately from the actual settlement events.
-  This avoids accidentally counting funding twice.
-*/
-function makeFundingHourly(candles, fundingEvents) {
-  const hr = new Array(candles.length).fill(0);
-
-  for (const event of fundingEvents) {
-    let idx = candles.findIndex(c => c.t >= event.t);
-
-    if (idx < 0) continue;
-
-    const nextEventIndex = fundingEvents.indexOf(event) + 1;
-    const next = fundingEvents[nextEventIndex];
-
-    const gapH = next
-      ? Math.max(1, (next.t - event.t) / 3600000)
-      : 8;
-
-    const perHour = event.rate / gapH;
-    const end = next
-      ? Math.min(candles.length, idx + Math.ceil(gapH))
-      : candles.length;
-
-    for (let i = idx; i < end; i++) {
-      hr[i] += perHour;
-    }
-  }
-
-  return hr;
-}
-
-function alignData(spot, perp, funding) {
-  const pMap = new Map(perp.map(x => [x.t, x]));
-  const sMap = new Map(spot.map(x => [x.t, x]));
-
-  const candles = [];
-
-  for (const [t, s] of sMap) {
-    const p = pMap.get(t);
-
-    if (!p) continue;
-
-    candles.push({
-      t,
-      so: s.o,
-      sh: s.h,
-      sl: s.l,
-      sc: s.c,
-      po: p.o,
-      ph: p.h,
-      pl: p.l,
-      pc: p.c
-    });
-  }
-
-  candles.sort((a, b) => a.t - b.t);
-
-  return {
-    t: candles.map(x => x.t),
-    so: candles.map(x => x.so),
-    sc: candles.map(x => x.sc),
-    pc: candles.map(x => x.pc),
-    ph: candles.map(x => x.ph),
-    pl: candles.map(x => x.pl),
-    fundingHr: makeFundingHourly(candles, funding),
-    fundingEvents: funding
-  };
-}
-
-function basisSeries(a) {
-  return a.pc.map((p, i) => {
-    const s = a.sc[i];
-
-    return Number.isFinite(p) &&
-      Number.isFinite(s) &&
-      s > 0
-      ? p / s - 1
-      : NaN;
+  return perp.map(candle => {
+    const spotClose = spotMap.get(candle.t);
+    return spotClose > 0 ? candle.close / spotClose - 1 : NaN;
   });
 }
 
-function costOneWay() {
+function fundingWindow(events, endTime, hours) {
+  const startTime = endTime - hours * 3600000;
+
+  const rows = events.filter(
+    event => event.t > startTime && event.t <= endTime
+  );
+
+  const sum = rows.reduce((total, event) => total + event.rate, 0);
+
+  return {
+    sum,
+    count: rows.length,
+    annualized: sum * (24 * 365 / hours)
+  };
+}
+
+function fundingForecast(events, endTime) {
+  const short = fundingWindow(
+    events,
+    endTime,
+    CFG.fundingShortHours
+  );
+
+  const long = fundingWindow(
+    events,
+    endTime,
+    CFG.fundingLongHours
+  );
+
+  const shortHourly = short.sum / CFG.fundingShortHours;
+  const longHourly = long.sum / CFG.fundingLongHours;
+
+  return {
+    short,
+    long,
+    conservativeHourly: Math.max(
+      0,
+      Math.min(shortHourly, longHourly)
+    )
+  };
+}
+
+function oneWayCost() {
   return CFG.spotFee + CFG.perpFee + 2 * CFG.slippage;
 }
 
 function roundTripCost() {
-  return 2 * costOneWay();
+  return 2 * oneWayCost();
 }
 
-function tradePnl(a, basis, fundingEvents, entryI, exitI, notional) {
-  const spotEntry = a.so[entryI];
-  const perpEntry = a.pc[entryI];
+function tradePnl({ entry, exit, entryBasis, exitBasis, fundingEvents }) {
+  // Approximation of the paired spot/perp basis trade P&L.
+  // Funding is calculated only from actual settlement timestamps.
+  const spotGross =
+    (1 / (1 + entryBasis)) -
+    (1 / (1 + exitBasis));
 
-  const spotExit = a.so[exitI];
-  const perpExit = a.pc[exitI];
+  const perpGross =
+    ((1 + entryBasis) / (1 + exitBasis)) - 1;
 
-  const spotPnl =
-    notional * (spotExit / spotEntry - 1);
+  const funding = fundingEvents
+    .filter(event => event.t > entry.t && event.t <= exit.t)
+    .reduce((sum, event) => sum + event.rate, 0);
 
-  const perpPnl =
-    notional * (1 - perpExit / perpEntry);
-
-  const entryT = a.t[entryI];
-  const exitT = a.t[exitI];
-
-  let funding = 0;
-  let fundingSettlements = 0;
-
-  for (const event of fundingEvents) {
-    if (event.t > entryT && event.t <= exitT) {
-      /*
-        Long spot + short perpetual.
-        Positive funding means shorts receive funding.
-      */
-      funding += notional * event.rate;
-      fundingSettlements++;
-    }
-  }
-
-  const entryFee =
-    notional * (CFG.spotFee + CFG.perpFee);
-
-  const exitFee =
-    notional * (CFG.spotFee + CFG.perpFee);
-
-  const entrySlippage =
-    notional * (2 * CFG.slippage);
-
-  const exitSlippage =
-    notional * (2 * CFG.slippage);
-
-  const costs =
-    entryFee +
-    exitFee +
-    entrySlippage +
-    exitSlippage;
-
-  const basisDeltaPnl =
-    notional * (basis[entryI] - basis[exitI]);
-
-  const mechanicalGross =
-    spotPnl +
-    perpPnl +
-    funding;
-
-  const net =
-    mechanicalGross -
-    costs;
+  const fees = 2 * (CFG.spotFee + CFG.perpFee);
+  const slippage = 4 * CFG.slippage;
+  const gross = spotGross + perpGross + funding;
+  const net = gross - fees - slippage;
 
   return {
-    spotPnl,
-    perpPnl,
-    basisDeltaPnl,
-    fundingPnl: funding,
-    fundingSettlements,
-    mechanicalGross,
-    gross: mechanicalGross,
-    entryFee,
-    exitFee,
-    entrySlippage,
-    exitSlippage,
-    costs,
+    spotGross,
+    perpGross,
+    funding,
+    fees,
+    slippage,
+    gross,
     net
   };
 }
 
-function simulateCoin(
-  a,
-  symbol,
-  marketStressByTime,
-  minBasisOverride = CFG.minBasis
-) {
-  const basis = basisSeries(a);
+function createDiagnostics() {
+  return {
+    barsChecked: 0,
+    stressReject: 0,
+    zReject: 0,
+    basisReject: 0,
+    fundingReject: 0,
+    stabilityReject: 0,
+    edgeReject: 0,
+    accepted: 0
+  };
+}
+
+function simulateCoin(data, minimumBasis) {
+  const { candles, basis, fundingEvents, marketStress } = data;
   const trades = [];
+  const diagnostics = createDiagnostics();
 
-  let open = null;
+  let openTrade = null;
 
-  const startI = Math.max(
-    CFG.basisLookbackHours + 24,
-    CFG.fundingLongHours + 24
-  );
+  const startIndex =
+    CFG.basisLookbackHours +
+    CFG.fundingLongHours +
+    24;
 
-  for (
-    let i = startI;
-    i < a.t.length - 1;
-    i++
-  ) {
-    if (!Number.isFinite(basis[i])) continue;
+  for (let i = startIndex; i < candles.length - 1; i++) {
+    diagnostics.barsChecked++;
 
-    const stats =
-      rollingMeanStd(
+    if (openTrade) {
+      const candle = candles[i];
+      const holdHours =
+        (candle.t - openTrade.entry.t) / 3600000;
+
+      const stats = rollingMeanStd(
         basis,
         i,
         CFG.basisLookbackHours
       );
 
-    if (
-      !Number.isFinite(stats.std) ||
-      stats.std <= 0
-    ) {
-      continue;
-    }
+      if (!stats) continue;
 
-    const z =
-      (basis[i] - stats.mean) /
-      stats.std;
+      const z =
+        stats.std > 0
+          ? (basis[i] - stats.mean) / stats.std
+          : 0;
 
-    const f3 =
-      rollingSum(
-        a.fundingHr,
-        i + 1,
-        CFG.fundingShortHours
+      const funding = fundingForecast(
+        fundingEvents,
+        candle.t
       );
 
-    const f7 =
-      rollingSum(
-        a.fundingHr,
-        i + 1,
-        CFG.fundingLongHours
-      );
+      const fundingCollapse =
+        funding.short.annualized <= 0 ||
+        funding.short.annualized <=
+          openTrade.entryFunding3d * 0.25;
 
-    if (
-      f3.n < CFG.fundingShortHours * 0.7 ||
-      f7.n < CFG.fundingLongHours * 0.7
-    ) {
-      continue;
-    }
+      const adverseBasis =
+        basis[i] >= Math.max(
+          CFG.adverseBasisFloor,
+          openTrade.entryBasis + 0.0025
+        );
 
-    const f3Ann =
-      annualizeFunding(f3.sum);
+      const hardStop = z >= CFG.stopZ;
+      const adverseZ =
+        z >= openTrade.entryZ + CFG.adverseZExtra;
 
-    const f7Ann =
-      annualizeFunding(f7.sum);
+      let exitReason = null;
 
-    const fundingStable =
-      f3Ann >= CFG.fundingStability * f7Ann;
-
-    const marketStress =
-      marketStressByTime.get(a.t[i]) === true;
-
-    if (!open) {
-      if (
-        !marketStress &&
-        z >= CFG.entryZ &&
-        basis[i] >= minBasisOverride &&
-        f3Ann >= CFG.minFunding3dAnn &&
-        f7Ann >= CFG.minFunding7dAnn &&
-        fundingStable
+      if (holdHours >= CFG.maxHoldHours) {
+        exitReason = 'max_hold';
+      } else if (hardStop || adverseZ || adverseBasis) {
+        exitReason = 'adverse_basis';
+      } else if (
+        holdHours >= CFG.minHoldHours &&
+        z <= CFG.exitZ
       ) {
-        const expectedBasis =
-          Math.max(
-            0,
-            basis[i] - stats.mean
-          );
+        exitReason = 'basis_convergence';
+      } else if (
+        holdHours >= CFG.minHoldHours &&
+        fundingCollapse
+      ) {
+        exitReason = 'funding_collapse';
+      }
 
-        const expectedFunding =
-          Math.max(
-            0,
-            f7Ann *
-              (CFG.maxHoldHours / 24 / 365)
-          );
+      if (exitReason) {
+        const exit = candles[i + 1];
 
-        const expectedEdge =
-          expectedBasis +
-          expectedFunding;
+        const pnl = tradePnl({
+          entry: openTrade.entry,
+          exit,
+          entryBasis: openTrade.entryBasis,
+          exitBasis: basis[i],
+          fundingEvents
+        });
 
-        const requiredEdge =
-          roundTripCost() *
-          (1 + CFG.minNetEdgeMultiple);
+        trades.push({
+          symbol: data.symbol,
+          entryTime: openTrade.entry.t,
+          exitTime: exit.t,
+          holdHours:
+            (exit.t - openTrade.entry.t) / 3600000,
+          entryBasis: openTrade.entryBasis,
+          exitBasis: basis[i],
+          entryZ: openTrade.entryZ,
+          exitZ: z,
+          entryFunding3d: openTrade.entryFunding3d,
+          entryFunding7d: openTrade.entryFunding7d,
+          ...pnl,
+          exitReason
+        });
 
-        if (expectedEdge >= requiredEdge) {
-          open = {
-            signalI: i,
-            entryI: i + 1,
-            entryBasis: basis[i + 1],
-            entryZ: z,
-            entryFunding3d: f3Ann,
-            entryFunding7d: f7Ann,
-            expectedBasis,
-            expectedFunding,
-            requiredEdge
-          };
-        }
+        openTrade = null;
       }
 
       continue;
     }
 
-    const held =
-      i - open.entryI + 1;
+    if (marketStress[i]) {
+      diagnostics.stressReject++;
+      continue;
+    }
 
-    const fundingCollapse =
-      f3Ann <= 0 ||
-      f3Ann <= open.entryFunding3d * 0.25;
+    const stats = rollingMeanStd(
+      basis,
+      i,
+      CFG.basisLookbackHours
+    );
 
-    const basisConverged =
-      held >= CFG.minHoldHours &&
-      z <= CFG.exitZ;
+    if (!stats || stats.std <= 0) continue;
 
-    const basisStd =
-      Number.isFinite(stats.std)
-        ? stats.std
-        : 0;
+    const z = (basis[i] - stats.mean) / stats.std;
 
-    const adverseBasis =
-      held >= CFG.minHoldHours &&
-      (
-        basis[i] >=
-          open.entryBasis +
-          Math.max(
-            CFG.adverseBasisFloor,
-            basisStd
-          ) ||
-        z >=
-          open.entryZ +
-          CFG.adverseZExtra
-      );
+    if (z < CFG.entryZ) {
+      diagnostics.zReject++;
+      continue;
+    }
 
-    const maxHold =
-      held >= CFG.maxHoldHours;
+    if (basis[i] < minimumBasis) {
+      diagnostics.basisReject++;
+      continue;
+    }
+
+    const funding = fundingForecast(
+      fundingEvents,
+      candles[i].t
+    );
 
     if (
-      basisConverged ||
-      fundingCollapse ||
-      adverseBasis ||
-      maxHold
+      funding.short.annualized < CFG.minFunding3dAnn ||
+      funding.long.annualized < CFG.minFunding7dAnn
     ) {
-      const exitI =
-        Math.min(
-          i + 1,
-          a.t.length - 1
-        );
-
-      const exitStats =
-        rollingMeanStd(
-          basis,
-          i,
-          CFG.basisLookbackHours
-        );
-
-      const exitZ =
-        Number.isFinite(exitStats.std) &&
-        exitStats.std > 0
-          ? (
-              basis[i] -
-              exitStats.mean
-            ) / exitStats.std
-          : NaN;
-
-      const pnl =
-        tradePnl(
-          a,
-          basis,
-          a.fundingEvents,
-          open.entryI,
-          exitI,
-          CFG.slotNotional
-        );
-
-      trades.push({
-        symbol,
-        entryTime: a.t[open.entryI],
-        exitTime: a.t[exitI],
-        holdHours:
-          (a.t[exitI] -
-            a.t[open.entryI]) /
-          3600000,
-        entryBasis:
-          basis[open.entryI],
-        exitBasis:
-          basis[exitI],
-        basisChange:
-          basis[exitI] -
-          basis[open.entryI],
-        entryZ: open.entryZ,
-        exitZ,
-        entryFunding3d:
-          open.entryFunding3d,
-        entryFunding7d:
-          open.entryFunding7d,
-        expectedBasisAtEntry:
-          open.expectedBasis,
-        expectedFundingAtEntry:
-          open.expectedFunding,
-        requiredEdgeAtEntry:
-          open.requiredEdge,
-        reason:
-          basisConverged
-            ? 'basis-converged'
-            : fundingCollapse
-              ? 'funding-collapsed'
-              : adverseBasis
-                ? 'adverse-basis-stop'
-                : 'max-hold',
-        ...pnl
-      });
-
-      open = null;
+      diagnostics.fundingReject++;
+      continue;
     }
+
+    if (
+      funding.short.annualized <
+      funding.long.annualized * CFG.fundingStability
+    ) {
+      diagnostics.stabilityReject++;
+      continue;
+    }
+
+    const expectedBasis =
+      Math.max(0, basis[i] - stats.mean);
+
+    const expectedFunding =
+      funding.conservativeHourly *
+      CFG.maxHoldHours;
+
+    const expectedEdge =
+      expectedBasis + expectedFunding;
+
+    const requiredEdge =
+      roundTripCost() *
+      (1 + CFG.minNetEdgeMultiple);
+
+    if (expectedEdge < requiredEdge) {
+      diagnostics.edgeReject++;
+      continue;
+    }
+
+    diagnostics.accepted++;
+
+    // Signal at candle i, execute at next candle open.
+    openTrade = {
+      entry: candles[i + 1],
+      entryBasis: basis[i],
+      entryZ: z,
+      entryFunding3d: funding.short.annualized,
+      entryFunding7d: funding.long.annualized
+    };
   }
 
-  if (open) {
-    const exitI =
-      a.t.length - 1;
+  if (openTrade) {
+    const i = candles.length - 1;
+    const exit = candles[i];
 
-    const exitStats =
-      rollingMeanStd(
-        basis,
-        exitI,
-        CFG.basisLookbackHours
-      );
-
-    const exitZ =
-      Number.isFinite(exitStats.std) &&
-      exitStats.std > 0
-        ? (
-            basis[exitI] -
-            exitStats.mean
-          ) / exitStats.std
-        : NaN;
-
-    const pnl =
-      tradePnl(
-        a,
-        basis,
-        a.fundingEvents,
-        open.entryI,
-        exitI,
-        CFG.slotNotional
-      );
+    const pnl = tradePnl({
+      entry: openTrade.entry,
+      exit,
+      entryBasis: openTrade.entryBasis,
+      exitBasis: basis[i],
+      fundingEvents
+    });
 
     trades.push({
-      symbol,
-      entryTime: a.t[open.entryI],
-      exitTime: a.t[exitI],
+      symbol: data.symbol,
+      entryTime: openTrade.entry.t,
+      exitTime: exit.t,
       holdHours:
-        (a.t[exitI] -
-          a.t[open.entryI]) /
-        3600000,
-      entryBasis:
-        basis[open.entryI],
-      exitBasis:
-        basis[exitI],
-      basisChange:
-        basis[exitI] -
-        basis[open.entryI],
-      entryZ: open.entryZ,
-      exitZ,
-      entryFunding3d:
-        open.entryFunding3d,
-      entryFunding7d:
-        open.entryFunding7d,
-      expectedBasisAtEntry:
-        open.expectedBasis,
-      expectedFundingAtEntry:
-        open.expectedFunding,
-      requiredEdgeAtEntry:
-        open.requiredEdge,
-      reason: 'end-of-test',
-      ...pnl
+        (exit.t - openTrade.entry.t) / 3600000,
+      entryBasis: openTrade.entryBasis,
+      exitBasis: basis[i],
+      entryZ: openTrade.entryZ,
+      exitZ: null,
+      entryFunding3d: openTrade.entryFunding3d,
+      entryFunding7d: openTrade.entryFunding7d,
+      ...pnl,
+      exitReason: 'end_of_data'
     });
   }
 
-  return trades;
+  return { trades, diagnostics };
 }
 
-function aggregateTrades(
-  trades,
-  days,
-  symbols
-) {
-  const totalNet =
-    trades.reduce(
-      (s, t) => s + t.net,
-      0
-    );
+function aggregateTrades(trades) {
+  const net = trades.reduce(
+    (sum, trade) => sum + trade.net,
+    0
+  );
 
-  const totalFunding =
-    trades.reduce(
-      (s, t) => s + t.fundingPnl,
-      0
-    );
+  const wins = trades.filter(trade => trade.net > 0);
+  const losses = trades.filter(trade => trade.net <= 0);
 
-  const totalBasis =
-    trades.reduce(
-      (s, t) => s + t.basisDeltaPnl,
-      0
-    );
+  const grossProfit = wins.reduce(
+    (sum, trade) => sum + trade.net,
+    0
+  );
 
-  const totalSpot =
-    trades.reduce(
-      (s, t) => s + t.spotPnl,
-      0
-    );
+  const grossLoss = Math.abs(
+    losses.reduce((sum, trade) => sum + trade.net, 0)
+  );
 
-  const totalPerp =
-    trades.reduce(
-      (s, t) => s + t.perpPnl,
-      0
-    );
-
-  const totalEntryFees =
-    trades.reduce(
-      (s, t) => s + t.entryFee,
-      0
-    );
-
-  const totalExitFees =
-    trades.reduce(
-      (s, t) => s + t.exitFee,
-      0
-    );
-
-  const totalEntrySlippage =
-    trades.reduce(
-      (s, t) => s + t.entrySlippage,
-      0
-    );
-
-  const totalExitSlippage =
-    trades.reduce(
-      (s, t) => s + t.exitSlippage,
-      0
-    );
-
-  const totalFundingSettlements =
-    trades.reduce(
-      (s, t) => s + t.fundingSettlements,
-      0
-    );
-
-  const totalCosts =
-    trades.reduce(
-      (s, t) => s + t.costs,
-      0
-    );
-
-  const totalGross =
-    trades.reduce(
-      (s, t) => s + t.gross,
-      0
-    );
-
-  const wins =
-    trades.filter(t => t.net > 0);
-
-  const losses =
-    trades.filter(t => t.net < 0);
-
-  const daily = new Map();
-
-  for (const t of trades) {
-    const d =
-      new Date(t.exitTime)
-        .toISOString()
-        .slice(0, 10);
-
-    daily.set(
-      d,
-      (daily.get(d) || 0) +
-        t.net
-    );
-  }
-
-  const dailyReturns =
-    [...daily.values()];
+  const ordered = [...trades].sort(
+    (a, b) => a.exitTime - b.exitTime
+  );
 
   let equity = 0;
   let peak = 0;
-  let maxDD = 0;
+  let maxDrawdown = 0;
 
-  for (const d of dailyReturns) {
-    equity += d;
-    peak = Math.max(
-      peak,
-      equity
-    );
-
-    maxDD = Math.max(
-      maxDD,
+  for (const trade of ordered) {
+    equity += trade.net;
+    peak = Math.max(peak, equity);
+    maxDrawdown = Math.max(
+      maxDrawdown,
       peak - equity
     );
   }
 
-  const avg =
-    trades.length
-      ? totalNet / trades.length
-      : 0;
+  const holds = trades.map(
+    trade => trade.holdHours
+  );
 
-  const sorted =
-    [...trades]
-      .sort(
-        (a, b) =>
-          a.net - b.net
-      );
+  const sortedHolds = [...holds].sort(
+    (a, b) => a - b
+  );
 
-  const med =
-    trades.length
-      ? sorted[
-          Math.floor(
-            trades.length / 2
-          )
-        ].net
-      : 0;
+  let medianHold = 0;
 
-  const lossAmount =
-    losses.reduce(
-      (s, t) =>
-        s + Math.abs(t.net),
-      0
+  if (sortedHolds.length) {
+    const middle = Math.floor(
+      sortedHolds.length / 2
     );
 
-  const profitFactor =
-    lossAmount > 0
-      ? wins.reduce(
-          (s, t) =>
-            s + t.net,
-          0
-        ) / lossAmount
-      : Infinity;
+    medianHold =
+      sortedHolds.length % 2
+        ? sortedHolds[middle]
+        : (
+            sortedHolds[middle - 1] +
+            sortedHolds[middle]
+          ) / 2;
+  }
 
   return {
-    days,
-    symbols,
     trades: trades.length,
     wins: wins.length,
     losses: losses.length,
-    winRate:
+    winRate: trades.length
+      ? wins.length / trades.length
+      : 0,
+    net,
+    grossProfit,
+    grossLoss,
+    profitFactor:
+      grossLoss > 0
+        ? grossProfit / grossLoss
+        : null,
+    maxDrawdown,
+    averageTrade:
       trades.length
-        ? wins.length /
-          trades.length
+        ? net / trades.length
         : 0,
-
-    totalNet,
-
-    annualizedReturn:
-      days > 0
-        ? totalNet *
-          (365 / days)
+    averageHoldHours:
+      holds.length
+        ? holds.reduce((a, b) => a + b, 0) /
+          holds.length
         : 0,
-
-    fundingPnl: totalFunding,
-    fundingSettlements:
-      totalFundingSettlements,
-
-    spotPnl: totalSpot,
-    perpPnl: totalPerp,
-    basisDeltaPnl: totalBasis,
-    grossPnl: totalGross,
-
-    entryFees: totalEntryFees,
-    exitFees: totalExitFees,
-
-    entrySlippage:
-      totalEntrySlippage,
-    exitSlippage:
-      totalExitSlippage,
-
-    costs: totalCosts,
-
-    avgTrade: avg,
-    medianTrade: med,
-
-    avgHoldHours:
-      trades.length
-        ? trades.reduce(
-            (s, t) =>
-              s + t.holdHours,
-            0
-          ) / trades.length
-        : 0,
-
-    maxDrawdown: maxDD,
-    profitFactor,
-
-    bestTrade:
-      trades.length
-        ? Math.max(
-            ...trades.map(
-              t => t.net
-            )
-          )
-        : 0,
-
-    worstTrade:
-      trades.length
-        ? Math.min(
-            ...trades.map(
-              t => t.net
-            )
-          )
-        : 0,
-
-    exits:
-      trades.reduce(
-        (m, t) => {
-          m[t.reason] =
-            (m[t.reason] || 0) + 1;
-          return m;
-        },
-        {}
-      )
+    medianHoldHours: medianHold,
+    funding: trades.reduce(
+      (sum, trade) => sum + trade.funding,
+      0
+    ),
+    basisGross: trades.reduce(
+      (sum, trade) =>
+        sum + trade.spotGross + trade.perpGross,
+      0
+    ),
+    fees: trades.reduce(
+      (sum, trade) => sum + trade.fees,
+      0
+    ),
+    slippage: trades.reduce(
+      (sum, trade) => sum + trade.slippage,
+      0
+    ),
+    exitReasons: trades.reduce(
+      (result, trade) => {
+        result[trade.exitReason] =
+          (result[trade.exitReason] || 0) + 1;
+        return result;
+      },
+      {}
+    )
   };
 }
 
-function walkForward(
-  trades,
-  start,
-  end
-) {
-  const trainMs =
-    365 * 86400000;
-
-  const testMs =
-    90 * 86400000;
-
-  const rows = [];
-
-  let cursor =
-    start + trainMs;
-
-  while (
-    cursor + testMs <= end
-  ) {
-    const testStart =
-      cursor;
-
-    const testEnd =
-      cursor + testMs;
-
-    const tt =
-      trades.filter(
-        t =>
-          t.entryTime >=
-            testStart &&
-          t.entryTime <
-            testEnd
-      );
-
-    const net =
-      tt.reduce(
-        (s, t) =>
-          s + t.net,
-        0
-      );
-
-    rows.push({
-      testStart:
-        new Date(
-          testStart
-        ).toISOString(),
-
-      testEnd:
-        new Date(
-          testEnd
-        ).toISOString(),
-
-      trades: tt.length,
-      net,
-
-      avgTrade:
-        tt.length
-          ? net / tt.length
-          : 0,
-
-      winRate:
-        tt.length
-          ? tt.filter(
-              t => t.net > 0
-            ).length /
-            tt.length
-          : 0
-    });
-
-    cursor =
-      testEnd;
-  }
-
-  return rows;
-}
-
-async function loadSymbol(
-  symbol,
-  spot,
-  start,
-  end
-) {
-  const [
-    spotK,
-    perpK,
-    funding
-  ] = await Promise.all([
-    getKlines(
-      'spot',
-      spot,
-      start,
-      end
-    ),
-
-    getKlines(
-      'linear',
-      symbol,
-      start,
-      end
-    ),
-
-    getFunding(
-      symbol,
-      start,
-      end
-    )
-  ]);
+async function loadSymbol(item, start, end) {
+  const [spot, perp, fundingEvents] =
+    await Promise.all([
+      getKlines(
+        'spot',
+        item.spotSymbol,
+        start,
+        end
+      ),
+      getKlines(
+        'linear',
+        item.symbol,
+        start,
+        end
+      ),
+      getFunding(
+        item.symbol,
+        start,
+        end
+      )
+    ]);
 
   if (
-    spotK.length < 500 ||
-    perpK.length < 500
+    spot.length < 500 ||
+    perp.length < 500
   ) {
     return null;
   }
 
-  const aligned =
-    alignData(
-      spotK,
-      perpK,
-      funding
-    );
+  const spotMap = new Map(
+    spot.map(candle => [candle.t, candle])
+  );
 
-  if (
-    aligned.t.length < 500
-  ) {
-    return null;
-  }
+  const candles = perp.filter(
+    candle => spotMap.has(candle.t)
+  );
 
-  return aligned;
+  const alignedSpot = candles.map(
+    candle => spotMap.get(candle.t)
+  );
+
+  return {
+    symbol: item.symbol,
+    candles,
+    basis: basisSeries(
+      candles,
+      alignedSpot
+    ),
+    fundingEvents,
+    marketStress:
+      new Array(candles.length).fill(false)
+  };
 }
 
-async function runBacktest({
-  days = CFG.defaultDays,
-  top = CFG.top
-} = {}) {
-  if (state.running) {
-    throw new Error(
-      'A backtest is already running.'
-    );
-  }
+function calculateMarketStress(datasets) {
+  const byTime = new Map();
 
-  state.running = true;
-  state.startedAt =
-    new Date().toISOString();
-
-  state.finishedAt = null;
-  state.progress = 0;
-  state.stage = 'starting';
-  state.message = '';
-  state.error = null;
-  state.report = null;
-
-  try {
-    days = Math.max(
-      30,
-      Math.min(
-        730,
-        Number(days) ||
-          CFG.defaultDays
-      )
-    );
-
-    top = Math.max(
-      5,
-      Math.min(
-        60,
-        Number(top) ||
-          CFG.top
-      )
-    );
-
-    const end =
-      nowMs();
-
-    const start =
-      end -
-      days * 86400000;
-
-    const universe =
-      await getUniverse(top);
-
-    if (!universe.length) {
-      throw new Error(
-        'No symbols matched the liquidity/universe filters.'
-      );
-    }
-
-    state.stage =
-      'symbols';
-
-    state.message =
-      'Loading universe for cross-sectional basis-stress filter...';
-
-    const loaded = [];
-    const symbolStats = [];
-
-    let completed = 0;
-
-    const queue =
-      [...universe];
-
-    const workers =
-      Array.from(
-        {
-          length:
-            Math.min(
-              CFG.concurrency,
-              queue.length
-            )
-        },
-        async () => {
-          while (
-            queue.length
-          ) {
-            const u =
-              queue.shift();
-
-            state.message =
-              `Loading ${u.symbol} (${completed + 1}/${universe.length})...`;
-
-            try {
-              const data =
-                await loadSymbol(
-                  u.symbol,
-                  u.spot,
-                  start,
-                  end
-                );
-
-              if (!data) {
-                symbolStats.push({
-                  symbol:
-                    u.symbol,
-                  turnover24h:
-                    u.turnover24h,
-                  skipped: true
-                });
-              } else {
-                loaded.push({
-                  u,
-                  data
-                });
-
-                symbolStats.push({
-                  symbol:
-                    u.symbol,
-                  turnover24h:
-                    u.turnover24h,
-                  skipped: false
-                });
-              }
-            } catch (err) {
-              symbolStats.push({
-                symbol:
-                  u.symbol,
-                turnover24h:
-                  u.turnover24h,
-                skipped: true,
-                error:
-                  err.message
-              });
-            }
-
-            completed++;
-
-            state.progress =
-              Math.round(
-                (completed /
-                  universe.length) *
-                  65
-              );
-          }
-        }
-      );
-
-    await Promise.all(
-      workers
-    );
-
-    state.stage =
-      'stress-filter';
-
-    state.message =
-      'Building cross-sectional market stress filter...';
-
-    const stressCounts =
-      new Map();
-
-    const validCounts =
-      new Map();
-
-    for (const {
-      data
-    } of loaded) {
-      const bs =
-        basisSeries(data);
-
-      for (
-        let i = 6;
-        i < data.t.length;
-        i++
-      ) {
-        if (
-          !Number.isFinite(
-            bs[i]
-          ) ||
-          !Number.isFinite(
-            bs[i - 6]
-          )
-        ) {
-          continue;
-        }
-
-        const t =
-          data.t[i];
-
-        validCounts.set(
-          t,
-          (validCounts.get(t) ||
-            0) + 1
-        );
-
-        if (
-          bs[i] -
-            bs[i - 6] >=
-          CFG.marketStressBasisRise6h
-        ) {
-          stressCounts.set(
-            t,
-            (stressCounts.get(t) ||
-              0) + 1
-          );
-        }
-      }
-    }
-
-    const marketStressByTime =
-      new Map();
-
+  for (const data of datasets) {
     for (
-      const [t, n] of validCounts
+      let i = 6;
+      i < data.candles.length;
+      i++
     ) {
+      const time = data.candles[i].t;
+      const rise =
+        data.basis[i] -
+        data.basis[i - 6];
+
+      if (!byTime.has(time)) {
+        byTime.set(time, []);
+      }
+
+      byTime.get(time).push(rise);
+    }
+  }
+
+  for (const data of datasets) {
+    for (
+      let i = 6;
+      i < data.candles.length;
+      i++
+    ) {
+      const rises =
+        byTime.get(data.candles[i].t) || [];
+
+      if (!rises.length) continue;
+
       const breadth =
-        (stressCounts.get(t) ||
-          0) / n;
+        rises.filter(
+          rise =>
+            rise >=
+            CFG.marketStressBasisRise6h
+        ).length / rises.length;
 
-      marketStressByTime.set(
-        t,
-        breadth >=
-          CFG.marketStressBreadth
-      );
+      data.marketStress[i] =
+        breadth >= CFG.marketStressBreadth;
     }
+  }
+}
 
-    const variants = [
-      {
-        name:
-          'v3A_minBasis_0.8pct',
-        minBasis:
-          0.0080
-      },
+async function mapLimit(
+  items,
+  limit,
+  worker
+) {
+  const result = new Array(items.length);
+  let next = 0;
 
-      {
-        name:
-          'v3B_minBasis_1.0pct',
-        minBasis:
-          0.0100
-      }
-    ];
+  async function runner() {
+    while (true) {
+      const index = next++;
 
-    const variantReports =
-      [];
+      if (index >= items.length) return;
 
-    for (
-      const variant of variants
-    ) {
-      state.stage =
-        'simulation';
-
-      state.message =
-        `Simulating ${variant.name}...`;
-
-      const allTrades = [];
-      const variantStats = [];
-
-      for (
-        const {
-          u,
-          data
-        } of loaded
-      ) {
-        const trades =
-          simulateCoin(
-            data,
-            u.symbol,
-            marketStressByTime,
-            variant.minBasis
+      try {
+        result[index] =
+          await worker(
+            items[index],
+            index
           );
-
-        allTrades.push(
-          ...trades
-        );
-
-        variantStats.push({
-          symbol:
-            u.symbol,
-          turnover24h:
-            u.turnover24h,
-          trades:
-            trades.length,
-          net:
-            trades.reduce(
-              (s, t) =>
-                s + t.net,
-              0
-            ),
-          skipped: false
-        });
+      } catch (error) {
+        result[index] = {
+          error: error.message
+        };
       }
+    }
+  }
 
-      allTrades.sort(
-        (a, b) =>
-          a.entryTime -
-          b.entryTime
-      );
-
-      const accepted = [];
-      const openUntil = [];
-      const openSymbols =
-        new Set();
-
-      for (
-        const trade of allTrades
-      ) {
-        for (
-          let i =
-            openUntil.length - 1;
-          i >= 0;
-          i--
-        ) {
-          if (
-            openUntil[i]
-              .exitTime <=
-            trade.entryTime
-          ) {
-            openSymbols.delete(
-              openUntil[i]
-                .symbol
-            );
-
-            openUntil.splice(
-              i,
-              1
-            );
-          }
-        }
-
-        if (
-          openUntil.length >=
-            CFG.maxConcurrent ||
-          openSymbols.has(
-            trade.symbol
+  await Promise.all(
+    Array.from(
+      {
+        length:
+          Math.min(
+            limit,
+            items.length
           )
-        ) {
-          continue;
-        }
+      },
+      runner
+    )
+  );
 
-        accepted.push(
-          trade
-        );
+  return result;
+}
 
-        openUntil.push({
-          symbol:
-            trade.symbol,
-          exitTime:
-            trade.exitTime
-        });
+async function runBacktest(
+  days,
+  top
+) {
+  state.stage = 'universe';
+  state.progress = 2;
+  state.message =
+    'Loading Bybit market universe...';
 
-        openSymbols.add(
-          trade.symbol
-        );
-      }
+  const universe =
+    await getUniverse(top);
 
-      const summary =
-        aggregateTrades(
-          accepted,
-          days,
-          universe.map(
-            x => x.symbol
-          )
-        );
+  const end = Date.now();
+  const start =
+    end -
+    days * 86400000;
 
-      const wf =
-        walkForward(
-          accepted,
+  state.stage = 'data';
+  state.progress = 5;
+  state.message =
+    `Loading ${universe.length} symbols...`;
+
+  let completed = 0;
+
+  const results = await mapLimit(
+    universe,
+    CFG.concurrency,
+    async item => {
+      const data =
+        await loadSymbol(
+          item,
           start,
           end
         );
 
-      variantReports.push({
-        name:
-          variant.name,
-        minBasis:
-          variant.minBasis,
-        summary,
-        walkForward:
-          wf,
-        symbolStats:
-          variantStats.sort(
-            (a, b) =>
-              b.net - a.net
-          ),
+      completed++;
 
-        trades:
-          accepted.map(
-            t => ({
-              ...t,
-              entryTime:
-                new Date(
-                  t.entryTime
-                ).toISOString(),
-              exitTime:
-                new Date(
-                  t.exitTime
-                ).toISOString()
-            })
-          )
-      });
+      state.progress =
+        5 +
+        Math.round(
+          (completed /
+            Math.max(
+              1,
+              universe.length
+            )) *
+            55
+        );
+
+      state.message =
+        `Loaded ${completed}/${universe.length} symbols`;
+
+      return data;
+    }
+  );
+
+  const loaded =
+    results.filter(
+      result =>
+        result &&
+        !result.error
+    );
+
+  calculateMarketStress(loaded);
+
+  const variants = [
+    {
+      name: 'BRF-V3A',
+      minBasis: 0.008
+    },
+    {
+      name: 'BRF-V3B',
+      minBasis: 0.010
+    }
+  ];
+
+  const variantReports = [];
+
+  for (
+    let variantIndex = 0;
+    variantIndex <
+    variants.length;
+    variantIndex++
+  ) {
+    const variant =
+      variants[variantIndex];
+
+    state.stage =
+      'simulation';
+
+    state.progress =
+      60 +
+      Math.round(
+        (variantIndex /
+          variants.length) *
+          25
+      );
+
+    state.message =
+      `Running ${variant.name}...`;
+
+    let allTrades = [];
+    const diagnostics =
+      createDiagnostics();
+
+    for (const data of loaded) {
+      const result =
+        simulateCoin(
+          data,
+          variant.minBasis
+        );
+
+      allTrades.push(
+        ...result.trades
+      );
+
+      for (
+        const [key, value] of
+        Object.entries(
+          result.diagnostics
+        )
+      ) {
+        diagnostics[key] += value;
+      }
     }
 
-    const report = {
-      strategy:
-        'BRF v3 - Basis Reversion + Funding Confirmation',
+    allTrades.sort(
+      (a, b) =>
+        a.entryTime -
+        b.entryTime
+    );
 
-      generatedAt:
-        new Date().toISOString(),
+    // Portfolio concurrency and one-trade-per-symbol rule.
+    const selected = [];
+    const active = [];
 
-      dataWindow: {
-        start:
-          new Date(
-            start
-          ).toISOString(),
+    for (const trade of allTrades) {
+      while (
+        active.length &&
+        active[0].exitTime <=
+          trade.entryTime
+      ) {
+        active.shift();
+      }
 
-        end:
-          new Date(
-            end
-          ).toISOString(),
+      if (
+        active.length >=
+        CFG.maxConcurrent
+      ) {
+        continue;
+      }
 
-        days
-      },
+      if (
+        active.some(
+          activeTrade =>
+            activeTrade.symbol ===
+            trade.symbol
+        )
+      ) {
+        continue;
+      }
 
-      config: CFG,
+      selected.push(trade);
+      active.push(trade);
 
-      universe: {
-        requested: top,
-        loaded:
-          loaded.length,
+      active.sort(
+        (a, b) =>
+          a.exitTime -
+          b.exitTime
+      );
+    }
 
-        symbols:
-          universe.map(
-            x => x.symbol
-          ),
-
-        minTurnover24h:
-          CFG.minTurnover24h
-      },
-
-      marketStress: {
-        breadthThreshold:
-          CFG.marketStressBreadth,
-
-        basisRise6hThreshold:
-          CFG.marketStressBasisRise6h
-      },
-
-      variants:
-        variantReports
-    };
-
-    state.progress = 100;
-    state.stage =
-      'done';
-
-    state.message =
-      'Backtest complete.';
-
-    state.report =
-      report;
-
-    state.finishedAt =
-      new Date().toISOString();
-
-    return report;
-  } catch (err) {
-    state.stage =
-      'error';
-
-    state.error =
-      err.stack ||
-      err.message;
-
-    state.message =
-      err.message;
-
-    state.finishedAt =
-      new Date().toISOString();
-
-    throw err;
-  } finally {
-    state.running =
-      false;
+    variantReports.push({
+      name: variant.name,
+      minBasis: variant.minBasis,
+      summary:
+        aggregateTrades(
+          selected
+        ),
+      diagnostics,
+      trades: selected
+    });
   }
+
+  state.stage = 'complete';
+  state.progress = 100;
+  state.message =
+    'Backtest complete';
+
+  return {
+    strategy: 'BRF V3',
+    mode: 'backtest-only',
+    dataWindow: {
+      start:
+        new Date(
+          start
+        ).toISOString(),
+      end:
+        new Date(
+          end
+        ).toISOString(),
+      days
+    },
+    universe: {
+      requested: top,
+      loaded:
+        loaded.length
+    },
+    config: {
+      entryZ: CFG.entryZ,
+      minBasis: CFG.minBasis,
+      exitZ: CFG.exitZ,
+      stopZ: CFG.stopZ,
+      maxHoldHours:
+        CFG.maxHoldHours,
+      maxConcurrent:
+        CFG.maxConcurrent,
+      roundTripCost:
+        roundTripCost()
+    },
+    variants:
+      variantReports
+  };
 }
 
-function html() {
+function sendJson(
+  response,
+  status,
+  payload
+) {
+  const body =
+    JSON.stringify(payload);
+
+  response.writeHead(
+    status,
+    {
+      'Content-Type':
+        'application/json',
+      'Cache-Control':
+        'no-store'
+    }
+  );
+
+  response.end(body);
+}
+
+function renderHtml() {
   return `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>BRF V3 Backtest</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BRF V3 Research Backtest</title>
 <style>
-body{
-  font-family:Arial,sans-serif;
-  max-width:1100px;
-  margin:30px auto;
-  padding:0 16px;
-  line-height:1.45
-}
-button,input{
-  padding:10px;
-  font-size:16px
-}
-button{
-  cursor:pointer
-}
-pre{
-  background:#111;
-  color:#eee;
-  padding:16px;
-  border-radius:8px;
-  overflow:auto
-}
-.card{
-  border:1px solid #ddd;
-  border-radius:10px;
-  padding:16px;
-  margin:12px 0
-}
-.small{
-  color:#666
-}
+body{font-family:Arial,sans-serif;max-width:1100px;margin:40px auto;padding:0 20px}
+button,input{padding:9px;margin:4px}
+pre{background:#111;color:#eee;padding:16px;border-radius:8px;overflow:auto}
+.card{border:1px solid #ddd;border-radius:10px;padding:16px;margin-top:16px}
 </style>
 </head>
-
 <body>
-<h1>BRF V3 Backtest</h1>
-
-<p class="small">
-Basis Reversion + Funding Confirmation.
-Backtest only. No private API keys and no live trading.
-</p>
+<h1>BRF V3 Research Backtest</h1>
+<p>Backtest only. No live trading.</p>
 
 <div class="card">
-  <label>
-    Days
-    <input
-      id="days"
-      type="number"
-      value="${CFG.defaultDays}"
-      min="30"
-      max="730">
-  </label>
+<label>Days
+<input id="days" type="number"
+value="${CFG.defaultDays}"
+min="30" max="730">
+</label>
 
-  <label>
-    Top symbols
-    <input
-      id="top"
-      type="number"
-      value="${CFG.top}"
-      min="5"
-      max="60">
-  </label>
+<label>Top
+<input id="top" type="number"
+value="${CFG.top}"
+min="5" max="100">
+</label>
 
-  <button onclick="start()">
-    Start backtest
-  </button>
+<button onclick="start()">
+Run Backtest
+</button>
 </div>
 
 <div class="card">
-  <div id="status">
-    Idle
-  </div>
-
-  <div id="error"></div>
+<strong>Status</strong>
+<div id="status">Idle</div>
 </div>
 
 <div class="card">
-  <h2>Report</h2>
-  <pre id="report">
-No report yet.
-  </pre>
+<strong>Report</strong>
+<pre id="report">No report yet.</pre>
 </div>
 
 <script>
@@ -1765,80 +1128,60 @@ async function start(){
   const top =
     document.getElementById('top').value;
 
-  const r =
+  const response =
     await fetch(
       '/backtest/start?days=' +
-      encodeURIComponent(days) +
+      days +
       '&top=' +
-      encodeURIComponent(top)
+      top
     );
 
-  const j =
-    await r.json();
+  const result =
+    await response.json();
 
   document.getElementById(
     'status'
   ).textContent =
-    j.message ||
-    JSON.stringify(j);
+    result.message ||
+    JSON.stringify(result);
 
   poll();
 }
 
 async function poll(){
-  try{
-    const r =
-      await fetch(
-        '/backtest/status',
-        {
-          cache:'no-store'
-        }
+  const response =
+    await fetch(
+      '/backtest/status'
+    );
+
+  const result =
+    await response.json();
+
+  document.getElementById(
+    'status'
+  ).textContent =
+    (result.stage || '') +
+    ' | ' +
+    (result.message || '') +
+    ' | ' +
+    (result.progress || 0) +
+    '%';
+
+  if(result.report){
+    document.getElementById(
+      'report'
+    ).textContent =
+      JSON.stringify(
+        result.report,
+        null,
+        2
       );
+  }
 
-    const j =
-      await r.json();
-
-    document.getElementById(
-      'status'
-    ).textContent =
-      (j.stage || '') +
-      ' | ' +
-      (j.message || '') +
-      ' | ' +
-      (j.progress || 0) +
-      '%';
-
-    document.getElementById(
-      'error'
-    ).textContent =
-      j.error || '';
-
-    if(j.report){
-      document.getElementById(
-        'report'
-      ).textContent =
-        JSON.stringify(
-          j.report,
-          null,
-          2
-        );
-    }
-
-    if(j.running){
-      setTimeout(
-        poll,
-        1500
-      );
-    }
-  }catch(err){
-    document.getElementById(
-      'error'
-    ).textContent =
-      err.message;
-
+  if(result.running){
     setTimeout(
       poll,
-      3000
+      1500
     );
   }
 }
@@ -1849,47 +1192,20 @@ poll();
 </html>`;
 }
 
-function sendJson(
-  res,
-  code,
-  obj
-) {
-  const body =
-    JSON.stringify(obj);
-
-  res.writeHead(
-    code,
-    {
-      'Content-Type':
-        'application/json; charset=utf-8',
-
-      'Cache-Control':
-        'no-store'
-    }
-  );
-
-  res.end(body);
-}
-
 const server =
   http.createServer(
-    async (
-      req,
-      res
-    ) => {
+    async (request, response) => {
       try {
-        const u =
+        const url =
           new URL(
-            req.url,
-            `http://${req.headers.host}`
+            request.url,
+            `http://${request.headers.host}`
           );
 
         if (
-          u.pathname === '/' ||
-          u.pathname ===
-            '/index.html'
+          url.pathname === '/'
         ) {
-          res.writeHead(
+          response.writeHead(
             200,
             {
               'Content-Type':
@@ -1897,178 +1213,212 @@ const server =
             }
           );
 
-          res.end(
-            html()
+          return response.end(
+            renderHtml()
           );
-
-          return;
         }
 
         if (
-          u.pathname ===
+          url.pathname ===
           '/health'
         ) {
-          sendJson(
-            res,
+          return sendJson(
+            response,
             200,
             {
               ok: true,
+              strategy:
+                'BRF V3',
               running:
-                state.running,
-              stage:
-                state.stage
+                state.running
             }
           );
-
-          return;
         }
 
         if (
-          u.pathname ===
+          url.pathname ===
           '/backtest/start'
         ) {
-          if (
-            state.running
-          ) {
-            sendJson(
-              res,
+          if (state.running) {
+            return sendJson(
+              response,
               409,
               {
                 ok: false,
                 message:
-                  'Backtest already running.'
+                  'Backtest already running'
               }
             );
-
-            return;
           }
 
           const days =
-            Number(
-              u.searchParams.get(
-                'days'
-              ) ||
-              CFG.defaultDays
+            Math.min(
+              730,
+              Math.max(
+                30,
+                Number(
+                  url.searchParams.get(
+                    'days'
+                  ) ||
+                  CFG.defaultDays
+                )
+              )
             );
 
           const top =
-            Number(
-              u.searchParams.get(
-                'top'
-              ) ||
-              CFG.top
+            Math.min(
+              100,
+              Math.max(
+                5,
+                Number(
+                  url.searchParams.get(
+                    'top'
+                  ) ||
+                  CFG.top
+                )
+              )
             );
 
-          runBacktest({
+          state.running =
+            true;
+
+          state.startedAt =
+            new Date().toISOString();
+
+          state.finishedAt =
+            null;
+
+          state.progress = 0;
+          state.stage =
+            'starting';
+
+          state.message =
+            'Starting BRF V3 backtest';
+
+          state.report = null;
+          state.error = null;
+
+          runBacktest(
             days,
             top
-          }).catch(
-            () => {}
-          );
+          )
+            .then(report => {
+              state.report =
+                report;
 
-          sendJson(
-            res,
+              state.running =
+                false;
+
+              state.finishedAt =
+                new Date().toISOString();
+            })
+            .catch(error => {
+              state.running =
+                false;
+
+              state.stage =
+                'error';
+
+              state.error =
+                error.stack ||
+                error.message;
+
+              state.message =
+                error.message;
+            });
+
+          return sendJson(
+            response,
             202,
             {
               ok: true,
-
               message:
-                `Backtest started: ${days} days, top ${top}.`,
-
-              status:
-                '/backtest/status'
+                'Backtest started',
+              days,
+              top
             }
           );
-
-          return;
         }
 
         if (
-          u.pathname ===
+          url.pathname ===
           '/backtest/status'
         ) {
-          sendJson(
-            res,
+          return sendJson(
+            response,
             200,
             {
               running:
                 state.running,
-
               startedAt:
                 state.startedAt,
-
               finishedAt:
                 state.finishedAt,
-
               progress:
                 state.progress,
-
               stage:
                 state.stage,
-
               message:
                 state.message,
-
               error:
                 state.error,
-
               report:
                 state.report
                   ? {
-                      summary:
-                        state.report
-                          .variants
-                          ?.map(
-                            v => ({
-                              name:
-                                v.name,
-                              summary:
-                                v.summary
-                            })
-                          ),
-
+                      strategy:
+                        state.report.strategy,
+                      mode:
+                        state.report.mode,
                       dataWindow:
-                        state.report
-                          .dataWindow
+                        state.report.dataWindow,
+                      universe:
+                        state.report.universe,
+                      config:
+                        state.report.config,
+                      variants:
+                        state.report.variants.map(
+                          variant => ({
+                            name:
+                              variant.name,
+                            minBasis:
+                              variant.minBasis,
+                            summary:
+                              variant.summary,
+                            diagnostics:
+                              variant.diagnostics
+                          })
+                        )
                     }
                   : null
             }
           );
-
-          return;
         }
 
         if (
-          u.pathname ===
+          url.pathname ===
           '/backtest/report'
         ) {
-          if (
-            !state.report
-          ) {
-            sendJson(
-              res,
+          if (!state.report) {
+            return sendJson(
+              response,
               404,
               {
                 ok: false,
                 message:
-                  'No completed report yet.'
+                  'No completed report'
               }
             );
-
-            return;
           }
 
-          sendJson(
-            res,
+          return sendJson(
+            response,
             200,
             state.report
           );
-
-          return;
         }
 
-        sendJson(
-          res,
+        return sendJson(
+          response,
           404,
           {
             ok: false,
@@ -2076,14 +1426,15 @@ const server =
               'Not found'
           }
         );
-      } catch (err) {
-        sendJson(
-          res,
+      } catch (error) {
+        return sendJson(
+          response,
           500,
           {
             ok: false,
             error:
-              err.message
+              error.stack ||
+              error.message
           }
         );
       }
@@ -2094,16 +1445,7 @@ server.listen(
   PORT,
   () => {
     console.log(
-      `BRF V3 backtest server listening on port ${PORT}`
-    );
-
-    console.log(
-      `Open http://localhost:${PORT}/`
+      `BRF V3 research server listening on ${PORT}`
     );
   }
 );
-"""
-
-path = Path("/mnt/data/server.js")
-path.write_text(code, encoding="utf-8")
-print(f"Created: {path}")
