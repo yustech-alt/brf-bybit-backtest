@@ -1,0 +1,13 @@
+{
+  "name": "brf-bybit-backtest",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Basis Reversion + Funding Confirmation backtester for Bybit public market data",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

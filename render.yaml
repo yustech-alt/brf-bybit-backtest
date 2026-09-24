@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: brf-bybit-backtest
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: DAYS
+        value: "730"
+      - key: TOP
+        value: "35"
+      - key: CONCURRENCY
+        value: "4"
+      - key: REQUEST_DELAY_MS
+        value: "80"
