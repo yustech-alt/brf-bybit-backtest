@@ -1,25 +1,10 @@
 services:
   - type: web
-    name: brf-bybit-backtest-v2
+    name: brf-v3-bybit-backtest
     runtime: node
+    plan: free
     buildCommand: npm install
-    startCommand: node server.js
+    startCommand: npm start
     envVars:
       - key: NODE_VERSION
-        value: "20"
-      - key: DAYS
-        value: "730"
-      - key: TOP
-        value: "50"
-      - key: CONCURRENCY
-        value: "4"
-      - key: REQUEST_DELAY_MS
-        value: "80"
-      - key: MIN_TURNOVER_24H
-        value: "10000000"
-      - key: MIN_HOLD_HOURS
-        value: "6"
-      - key: MAX_HOLD_HOURS
-        value: "72"
-      - key: MAX_CONCURRENT
-        value: "5"
+        value: 20
