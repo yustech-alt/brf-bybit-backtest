@@ -1,7 +1,7 @@
 'use strict';
 
 /*
-  BRF v1: Basis Reversion + Funding Confirmation
+  BRF v2: Basis Reversion + Funding Confirmation
   Backtest only. Uses public Bybit V5 market-data endpoints.
 
   Strategy:
@@ -26,11 +26,12 @@ const API = process.env.BYBIT_BASE_URL || 'https://api.bybit.com';
 const CFG = {
   interval: '60',
   defaultDays: Number(process.env.DAYS || 730),
-  top: Number(process.env.TOP || 35),
+  top: Number(process.env.TOP || 50),
 
   // Portfolio
   slotNotional: Number(process.env.SLOT_NOTIONAL || 1),
   maxConcurrent: Number(process.env.MAX_CONCURRENT || 5),
+  minHoldHours: Number(process.env.MIN_HOLD_HOURS || 6),
 
   // Signal
   basisLookbackHours: Number(process.env.BASIS_LOOKBACK_HOURS || 336), // 14d
@@ -67,7 +68,7 @@ const CFG = {
   minNetEdgeMultiple: Number(process.env.MIN_NET_EDGE_MULTIPLE || 0.50),
 
   // Only use symbols with this minimum 24h turnover.
-  minTurnover24h: Number(process.env.MIN_TURNOVER_24H || 50_000_000)
+  minTurnover24h: Number(process.env.MIN_TURNOVER_24H || 10_000_000)
 };
 
 const state = {
@@ -478,62 +479,41 @@ function tradePnl(a, basis, fundingHr, entryI, exitI, notional) {
 function simulateCoin(a, symbol, btcStressByTime) {
   const basis = basisSeries(a);
   const trades = [];
-
   let open = null;
-
-  const startI = Math.max(
-    CFG.basisLookbackHours + 24,
-    CFG.fundingLongHours + 24
-  );
+  const startI = Math.max(CFG.basisLookbackHours + 24, CFG.fundingLongHours + 24);
 
   for (let i = startI; i < a.t.length - 1; i++) {
     if (!Number.isFinite(basis[i])) continue;
-
-    // Entry/exit signals are computed from the completed candle i
-    // and executed at candle i+1 open.
     const stats = rollingMeanStd(basis, i, CFG.basisLookbackHours);
     if (!Number.isFinite(stats.std) || stats.std <= 0) continue;
-
     const z = (basis[i] - stats.mean) / stats.std;
-
     const f3 = rollingSum(a.fundingHr, i + 1, CFG.fundingShortHours);
     const f7 = rollingSum(a.fundingHr, i + 1, CFG.fundingLongHours);
-
-    if (f3.n < CFG.fundingShortHours * 0.7) continue;
-    if (f7.n < CFG.fundingLongHours * 0.7) continue;
+    if (f3.n < CFG.fundingShortHours * 0.7 || f7.n < CFG.fundingLongHours * 0.7) continue;
 
     const f3Ann = annualizeFunding(f3.sum);
     const f7Ann = annualizeFunding(f7.sum);
-
-    const fundingStable =
-      f3Ann >= CFG.fundingStability * f7Ann;
-
+    const fundingStable = f3Ann >= CFG.fundingStability * f7Ann;
     const btcStress = btcStressByTime.get(a.t[i]) === true;
 
     if (!open) {
-      if (
-        !btcStress &&
-        z >= CFG.entryZ &&
-        basis[i] >= CFG.minBasis &&
-        f3Ann >= CFG.minFunding3dAnn &&
-        f7Ann >= CFG.minFunding7dAnn &&
-        fundingStable
-      ) {
-        // Economic hurdle:
-        // expected basis capture to its rolling mean + expected funding
-        // over the maximum hold must exceed a cost buffer.
+      if (!btcStress && z >= CFG.entryZ && basis[i] >= CFG.minBasis &&
+          f3Ann >= CFG.minFunding3dAnn && f7Ann >= CFG.minFunding7dAnn && fundingStable) {
         const expectedBasis = Math.max(0, basis[i] - stats.mean);
         const expectedFunding = Math.max(0, f7Ann * (CFG.maxHoldHours / 24 / 365));
         const expectedEdge = expectedBasis + expectedFunding;
-
-        if (expectedEdge >= roundTripCost() * (1 + CFG.minNetEdgeMultiple)) {
+        const requiredEdge = roundTripCost() * (1 + CFG.minNetEdgeMultiple);
+        if (expectedEdge >= requiredEdge) {
           open = {
             signalI: i,
             entryI: i + 1,
             entryBasis: basis[i + 1],
             entryZ: z,
             entryFunding3d: f3Ann,
-            entryFunding7d: f7Ann
+            entryFunding7d: f7Ann,
+            expectedBasis,
+            expectedFunding,
+            requiredEdge
           };
         }
       }
@@ -541,87 +521,56 @@ function simulateCoin(a, symbol, btcStressByTime) {
     }
 
     const held = i - open.entryI + 1;
+    const fundingCollapse = f3Ann <= 0 || f3Ann <= open.entryFunding3d * 0.25;
+    const basisConverged = held >= CFG.minHoldHours && z <= CFG.exitZ;
+    const adverseBasis = held >= CFG.minHoldHours && basis[i] >= open.entryBasis * 1.50;
+    const maxHold = held >= CFG.maxHoldHours;
 
-    const f3Now = f3Ann;
-    const fundingCollapse =
-      f3Now <= 0 ||
-      f3Now <= open.entryFunding3d * 0.25;
-
-    const basisConverged = z <= CFG.exitZ;
-    const basisStretched = z >= CFG.stopZ;
-
-    if (
-      basisConverged ||
-      fundingCollapse ||
-      basisStretched ||
-      held >= CFG.maxHoldHours
-    ) {
+    if (basisConverged || fundingCollapse || adverseBasis || maxHold) {
       const exitI = Math.min(i + 1, a.t.length - 1);
-      const pnl = tradePnl(
-        a,
-        basis,
-        a.fundingHr,
-        open.entryI,
-        exitI,
-        CFG.slotNotional
-      );
-
+      const exitStats = rollingMeanStd(basis, i, CFG.basisLookbackHours);
+      const exitZ = Number.isFinite(exitStats.std) && exitStats.std > 0
+        ? (basis[i] - exitStats.mean) / exitStats.std : NaN;
+      const pnl = tradePnl(a, basis, a.fundingHr, open.entryI, exitI, CFG.slotNotional);
       trades.push({
         symbol,
-        entryTime: a.t[open.entryI],
-        exitTime: a.t[exitI],
+        entryTime: a.t[open.entryI], exitTime: a.t[exitI],
         holdHours: (a.t[exitI] - a.t[open.entryI]) / 3600000,
-        entryBasis: basis[open.entryI],
-        exitBasis: basis[exitI],
-        entryZ: open.entryZ,
-        exitZ: z,
-        entryFunding3d: open.entryFunding3d,
-        entryFunding7d: open.entryFunding7d,
-        reason:
-          basisConverged ? 'basis-converged' :
-          fundingCollapse ? 'funding-collapsed' :
-          basisStretched ? 'basis-stop' :
-          'max-hold',
+        entryBasis: basis[open.entryI], exitBasis: basis[exitI],
+        basisChange: basis[exitI] - basis[open.entryI],
+        entryZ: open.entryZ, exitZ,
+        entryFunding3d: open.entryFunding3d, entryFunding7d: open.entryFunding7d,
+        expectedBasisAtEntry: open.expectedBasis,
+        expectedFundingAtEntry: open.expectedFunding,
+        requiredEdgeAtEntry: open.requiredEdge,
+        reason: basisConverged ? 'basis-converged' : fundingCollapse ? 'funding-collapsed' : adverseBasis ? 'adverse-basis-stop' : 'max-hold',
         ...pnl
       });
-
       open = null;
     }
   }
 
-  // Close any remaining position at final candle.
   if (open) {
     const exitI = a.t.length - 1;
-    const stats = rollingMeanStd(basis, exitI, CFG.basisLookbackHours);
-    const z = Number.isFinite(stats.std) && stats.std > 0
-      ? (basis[exitI] - stats.mean) / stats.std
-      : NaN;
-
-    const pnl = tradePnl(
-      a,
-      basis,
-      a.fundingHr,
-      open.entryI,
-      exitI,
-      CFG.slotNotional
-    );
-
+    const exitStats = rollingMeanStd(basis, exitI, CFG.basisLookbackHours);
+    const exitZ = Number.isFinite(exitStats.std) && exitStats.std > 0
+      ? (basis[exitI] - exitStats.mean) / exitStats.std : NaN;
+    const pnl = tradePnl(a, basis, a.fundingHr, open.entryI, exitI, CFG.slotNotional);
     trades.push({
       symbol,
-      entryTime: a.t[open.entryI],
-      exitTime: a.t[exitI],
+      entryTime: a.t[open.entryI], exitTime: a.t[exitI],
       holdHours: (a.t[exitI] - a.t[open.entryI]) / 3600000,
-      entryBasis: basis[open.entryI],
-      exitBasis: basis[exitI],
-      entryZ: open.entryZ,
-      exitZ: z,
-      entryFunding3d: open.entryFunding3d,
-      entryFunding7d: open.entryFunding7d,
+      entryBasis: basis[open.entryI], exitBasis: basis[exitI],
+      basisChange: basis[exitI] - basis[open.entryI],
+      entryZ: open.entryZ, exitZ,
+      entryFunding3d: open.entryFunding3d, entryFunding7d: open.entryFunding7d,
+      expectedBasisAtEntry: open.expectedBasis,
+      expectedFundingAtEntry: open.expectedFunding,
+      requiredEdgeAtEntry: open.requiredEdge,
       reason: 'end-of-test',
       ...pnl
     });
   }
-
   return trades;
 }
 
@@ -846,17 +795,20 @@ async function runBacktest({ days = CFG.defaultDays, top = CFG.top } = {}) {
     // Enforce portfolio-level max concurrent slots.
     const accepted = [];
     const openUntil = [];
+    const openSymbols = new Set();
 
     for (const t of allTrades) {
-      // Remove positions that have already closed.
       for (let i = openUntil.length - 1; i >= 0; i--) {
-        if (openUntil[i] <= t.entryTime) openUntil.splice(i, 1);
+        if (openUntil[i].exitTime <= t.entryTime) {
+          openSymbols.delete(openUntil[i].symbol);
+          openUntil.splice(i, 1);
+        }
       }
-
       if (openUntil.length >= CFG.maxConcurrent) continue;
-
+      if (openSymbols.has(t.symbol)) continue;
       accepted.push(t);
-      openUntil.push(t.exitTime);
+      openUntil.push({ symbol: t.symbol, exitTime: t.exitTime });
+      openSymbols.add(t.symbol);
     }
 
     const summary = aggregateTrades(
@@ -868,7 +820,7 @@ async function runBacktest({ days = CFG.defaultDays, top = CFG.top } = {}) {
     const wf = walkForward(accepted, start, end);
 
     const report = {
-      strategy: 'BRF v1 - Basis Reversion + Funding Confirmation',
+      strategy: 'BRF v2 - Basis Reversion + Funding Confirmation',
       generatedAt: new Date().toISOString(),
       dataWindow: {
         start: new Date(start).toISOString(),
@@ -928,7 +880,7 @@ pre{background:#111;color:#eee;padding:16px;border-radius:8px;overflow:auto}
 </style>
 </head>
 <body>
-<h1>BRF v1 Backtest</h1>
+<h1>BRF v2 Backtest</h1>
 <p class="small">Basis Reversion + Funding Confirmation. Backtest only.</p>
 
 <div class="card">
