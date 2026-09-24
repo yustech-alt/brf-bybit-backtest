@@ -966,7 +966,7 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === '/' || u.pathname === '/index.html') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(html());
-      return;
+      return; 
     }
 
     if (u.pathname === '/health') {
